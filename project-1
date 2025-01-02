@@ -1,0 +1,349 @@
+from flask import Flask, jsonify, request
+from datetime import datetime
+from dash.dependencies import Output, Input
+from dash import Dash, html, dcc
+import plotly.express as px
+import os
+import plotly.graph_objects as go
+import openai
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+app = Flask(__name__)
+
+# Sample data to store appointments
+appointments = []
+appointment_id_counter = 1  # To assign unique IDs to appointments
+
+# Set your GPT-4o API Key
+openai.api_key = "api key"
+
+# Email configuration
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+EMAIL_ADDRESS = "21EC1151@students.stjosephstechnology.ac.in"  # Replace with your email
+EMAIL_PASSWORD = "kpwssrbngodzfueq"  # Replace with your email password
+
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+
+
+# Function to predict attendance using GPT-4o
+def predict_attendance_with_gpt(name, age, history_of_no_show, reason):
+    try:
+        response = openai.chat.completions.create(  # Correct method for v1.57.4
+            model="gpt-4o",  # Ensure this model name is available to your account
+            messages=[
+                {"role": "system", "content": "You are an assistant that predicts patient attendance probabilities."},
+                {"role": "user",
+                 "content": f"Predict the likelihood (as a percentage) that a patient will attend their appointment based on the following details:\n"
+                            f"- Name: {name}\n"
+                            f"- Age: {age}\n"
+                            f"- History of No-Show (1 = yes, 0 = no): {history_of_no_show}\n"
+                            f"- Reason for Appointment: {reason}\n\n"
+                            f"Please provide only the predicted attendance probability as a number."}
+            ],
+            temperature=0.3,
+            max_tokens=10
+        )
+
+        # Extract the response content
+        probability_text = response.choices[0].message.content.strip()
+        print(f"GPT Response: {probability_text}")  # Debugging
+        probability = float(probability_text)
+        return round(probability / 100, 2)  # Convert to a 0-1 scale
+    except Exception as e:
+        print(f"Error with GPT-4o API: {e}")
+        return None
+
+
+# Validation function
+def validate_appointment(data):
+    required_fields = ["name", "date", "time", "reason"]
+    missing_fields = [field for field in required_fields if field not in data]
+    if missing_fields:
+        return False, f"Missing fields: {', '.join(missing_fields)}"
+    return True, None
+
+
+# Route: Get all appointments
+# @app.route('/appointments', methods=['GET'])
+# def get_appointments():
+#    return jsonify({"appointments": appointments})
+
+
+@app.route('/appointments', methods=['POST'])
+def add_appointment():
+    global appointment_id_counter
+    data = request.get_json()
+
+    # Validate input
+    is_valid, error_message = validate_appointment(data)
+    if not is_valid:
+        return jsonify({"error": error_message}), 400
+
+    # Call GPT-4o for attendance prediction
+    attendance_probability = predict_attendance_with_gpt(
+        data["name"], data["age"], data["history_of_no_show"], data["reason"]
+    )
+
+    if attendance_probability is None:
+        return jsonify({"error": "Failed to predict attendance"}), 500
+
+    # Add the appointment with a default status
+    new_appointment = {
+        "id": appointment_id_counter,
+        "name": data.get("name"),
+        "email": data.get("email"),
+        "date": data.get("date"),
+        "time": data.get("time"),
+        "reason": data.get("reason"),
+        "attendance_probability": attendance_probability,
+        "status": data.get("status", "Pending")  # Default to "Pending"
+    }
+    appointments.append(new_appointment)
+    appointment_id_counter += 1
+
+    # Send confirmation email
+    email_subject = "Appointment Confirmation"
+    email_body = (
+        f"Dear {data.get('name')},\n\n"
+        f"Your appointment on {data.get('date')} at {data.get('time')} has been confirmed.\n\n"
+        f"Reason: {data.get('reason')}\n\n"
+        f"Thank you for choosing our service!"
+    )
+    send_email(data.get("email"), email_subject, email_body)
+
+    return jsonify({"message": "Appointment added successfully", "appointment": new_appointment}), 201
+
+
+def send_email(recipient_email, subject, body):
+    try:
+        # Set up the email
+        msg = MIMEMultipart()
+        msg["From"] = EMAIL_ADDRESS
+        msg["To"] = recipient_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        # Connect to the SMTP server and send the email
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()  # Secure the connection
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.send_message(msg)
+
+        print(f"Email sent successfully to {recipient_email}!")
+        return True
+    except Exception as e:
+        print(f"Error sending email: {e}")
+        return False
+
+
+@app.route('/appointments/sorted', methods=['GET'])
+def get_sorted_appointments():
+    sorted_appointments = sorted(appointments, key=lambda x: x["attendance_probability"], reverse=True)
+    return jsonify({"appointments": sorted_appointments})
+
+
+@app.route('/appointments', methods=['GET'])
+def get_appointments():
+    page = int(request.args.get('page', 1))  # Default to page 1
+    per_page = int(request.args.get('per_page', 5))  # Default 5 items per page
+    start = (page - 1) * per_page
+    end = start + per_page
+    paginated_appointments = appointments[start:end]
+    return jsonify({
+        "appointments": paginated_appointments,
+        "total": len(appointments),
+        "page": page,
+        "per_page": per_page
+    })
+
+
+# Route: Update an appointment
+@app.route('/appointments/<int:id>', methods=['PUT'])
+def update_appointment(id):
+    data = request.get_json()
+    for appointment in appointments:
+        if appointment["id"] == id:
+            appointment["name"] = data.get("name", appointment["name"])
+            appointment["date"] = data.get("date", appointment["date"])
+            appointment["time"] = data.get("time", appointment["time"])
+            appointment["reason"] = data.get("reason", appointment["reason"])
+            return jsonify({"message": "Appointment updated successfully", "appointment": appointment})
+    return jsonify({"error": "Appointment not found"}), 404
+
+
+# Route: Delete an appointment
+@app.route('/appointments/<int:id>', methods=['DELETE'])
+def delete_appointment(id):
+    global appointments
+    appointments = [appt for appt in appointments if appt["id"] != id]
+    return jsonify({"message": "Appointment deleted successfully"})
+
+
+# Route: Search appointments by name
+@app.route('/appointments/search', methods=['GET'])
+def search_appointments():
+    name = request.args.get('name')  # Get the 'name' query parameter
+    if not name:
+        return jsonify({"error": "Name parameter is required"}), 400
+
+    # Filter appointments where the name matches (case-insensitive)
+    matching_appointments = [appt for appt in appointments if name.lower() in appt["name"].lower()]
+
+    if matching_appointments:
+        return jsonify({"appointments": matching_appointments})
+    else:
+        return jsonify({"message": "No appointments found for the given name"}), 404
+
+
+@app.route('/predict', methods=['POST'])
+def predict_attendance():
+    data = request.get_json()
+    name = data.get("name")
+    age = data.get("age")
+    history_of_no_show = data.get("history_of_no_show")
+    reason = data.get("reason")
+
+    # Validate input
+    if not all([name, age, history_of_no_show, reason]):
+        return jsonify({"error": "All fields (name, age, history_of_no_show, reason) are required"}), 400
+
+    # Call GPT-4o for prediction
+    attendance_probability = predict_attendance_with_gpt(name, age, history_of_no_show, reason)
+    if attendance_probability is not None:
+        return jsonify({"attendance_probability": attendance_probability})
+    else:
+        return jsonify({"error": "Failed to predict attendance"}), 500
+
+
+# cancellation url route for patients to cancel their appointments
+@app.route('/appointments/<int:id>/cancel', methods=['POST'])
+def cancel_appointment(id):
+    global appointments
+    for appointment in appointments:
+        if appointment["id"] == id:
+            appointment["status"] = "Cancelled"
+            return jsonify({"message": "Appointment cancelled successfully", "appointment": appointment}), 200
+    return jsonify({"error": "Appointment not found"}), 404
+
+
+# Automated Rescheduling
+# Allows admins to reschedule appointments by providing a new date and time.
+@app.route('/appointments/<int:id>/reschedule', methods=['POST'])
+def reschedule_appointment(id):
+    data = request.get_json()
+    new_date = data.get("new_date")
+    new_time = data.get("new_time")
+
+    for appointment in appointments:
+        if appointment["id"] == id:
+            appointment["date"] = new_date
+            appointment["time"] = new_time
+            appointment["status"] = "Rescheduled"
+            return jsonify({"message": "Appointment rescheduled successfully", "appointment": appointment}), 200
+    return jsonify({"error": "Appointment not found"}), 404
+
+
+@app.route('/appointments/check-no-shows', methods=['POST'])
+def check_no_shows():
+    current_time = datetime.now()
+    no_shows = []
+
+    for appointment in appointments:
+        appointment_time = datetime.strptime(f"{appointment['date']} {appointment['time']}", "%Y-%m-%d %I:%M %p")
+        if appointment_time < current_time and appointment.get("status") not in ["Cancelled", "Rescheduled"]:
+            appointment["status"] = "No-Show"
+            no_shows.append(appointment)
+
+    return jsonify({"message": "No-show check completed", "no_shows": no_shows}), 200
+
+
+# Initialize Dash app
+dash_app = Dash(__name__, server=app, url_base_pathname='/dashboard/')
+
+
+# Function to get analytics data
+def get_analytics_data():
+    print("Current appointments data:", appointments)  # Debugging print
+    total_appointments = len(appointments)
+    cancelled = len([a for a in appointments if a.get("status") == "Cancelled"])
+    no_shows = len([a for a in appointments if a.get("status") == "No-Show"])
+    attended = len([a for a in appointments if a.get("status") == "Attended"])
+    pending = len([a for a in appointments if a.get("status") == "Pending"])
+    return {
+        "Attended": attended,
+        "Cancelled": cancelled,
+        "No-Shows": no_shows,
+        "Pending": pending
+    }
+
+
+# Function to create a bar chart
+def create_bar_chart(data):
+    print("Data for bar chart:", data)  # Debugging print statement
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=list(data.keys()),
+                y=list(data.values()),
+                marker_color=['#4CAF50', '#FF5733', '#FFC300', '#808080']
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Appointment Status Overview",
+        xaxis_title="Status",
+        yaxis_title="Count",
+        template="plotly_white"
+    )
+    return fig
+
+
+# Add a callback to update the graph dynamically
+@dash_app.callback(
+    Output("status-bar-chart", "figure"),
+    Input("interval-component", "n_intervals")  # Triggers every interval
+)
+def update_graph(n):
+    print("Updating graph...")  # Debugging
+    return create_bar_chart(get_analytics_data())
+
+
+# Add an interval component to the layout
+dash_app.layout = html.Div(children=[
+    html.H1("Admin Dashboard", style={"textAlign": "center"}),
+    dcc.Graph(id="status-bar-chart"),
+    dcc.Interval(
+        id="interval-component",
+        interval=5000,  # Refresh every 5 seconds
+        n_intervals=0
+    )
+])
+
+print(get_analytics_data())
+
+
+@app.route('/appointments/<int:id>/status', methods=['PUT'])
+def update_status(id):
+    data = request.get_json()
+    new_status = data.get("status")
+
+    # Validate input
+    if not new_status or new_status not in ["Attended", "Cancelled", "No-Show"]:
+        return jsonify({"error": "Invalid status. Must be 'Attended', 'Cancelled', or 'No-Show'"}), 400
+
+    # Find the appointment and update its status
+    for appointment in appointments:
+        if appointment["id"] == id:
+            appointment["status"] = new_status
+            return jsonify({"message": "Status updated successfully", "appointment": appointment}), 200
+
+    return jsonify({"error": "Appointment not found"}), 404
+
+
+# Run the app
+if __name__ == '__main__':
+    app.run(debug=True)
